@@ -1,0 +1,189 @@
+# =============================================================================
+# nonortc — CNB（cnb.cool）打包发布流水线
+#
+# 触发方式：仓库 → 代码 → 分支详情页 → 「打包并发布 nonortc」按钮
+#           （按钮定义见 .cnb/web_trigger.yml，事件 web_trigger_release）
+# 功能：手动填写版本号 → 构建 zip + CRX3 → 发布到本 CNB 代码仓库的 Release
+#
+# 打包脚本复用仓库内的 .github/scripts/build.py（纯 Python 标准库 + openssl，
+# 实现 CRX3 签名打包），两条流水线共用一份实现，避免双份维护。
+#
+# 官方依据：
+#   - 手动触发 / inputs      https://docs.cnb.cool/zh/build/web-trigger.html
+#   - git:release 内置任务    https://docs.cnb.cool/zh/build/internal-steps/git/release.html
+#   - 附件插件 attachments    https://cnb.cool/cnb/plugins/cnbcool/attachments
+#   - 文件引用 include        https://docs.cnb.cool/zh/file-reference.html
+# =============================================================================
+"**":
+  web_trigger_release:
+    - name: 打包并发布 nonortc
+      # 需要 python3 + openssl + git；Debian 版 python 镜像三者齐备
+      image: python:3.12-bookworm
+      env:
+        BUILD_SCRIPT: .github/scripts/build.py
+        SOURCE_DIR: .
+      stages:
+        - name: 环境自检与版本号校验
+          script: |
+            set -euo pipefail
+            command -v python3 >/dev/null || { echo "ERROR: python3 不可用"; exit 1; }
+            command -v openssl >/dev/null || { apt-get update -qq && apt-get install -y -qq openssl; }
+            command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git; }
+            if [ -z "${VERSION:-}" ]; then
+              echo "ERROR: 版本号 VERSION 为空，请在触发弹窗中填写"
+              exit 1
+            fi
+            V="${VERSION#v}"
+            if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)?$'; then
+              echo "ERROR: 版本号格式非法：$VERSION（应为 1.4.2 或 v1.4.2）"
+              exit 1
+            fi
+            mkdir -p dist .cnb-build
+            printf '%s' "$V" > .cnb-build/version
+            echo "构建版本：$V    Release Tag：$VERSION"
+
+        - name: 准备 CRX 签名私钥
+          script: |
+            set -euo pipefail
+            mkdir -p .cnb-build
+            if [ "${SIGN_MODE:-secret}" = "secret" ] && [ -n "${CRX_PRIVATE_KEY:-}" ]; then
+              printf '%s\n' "$CRX_PRIVATE_KEY" > .cnb-build/key.pem
+              openssl rsa -in .cnb-build/key.pem -noout -check
+              echo "复用仓库密钥 CRX_PRIVATE_KEY（扩展 ID 保持稳定）"
+            else
+              if [ "${SIGN_MODE:-secret}" = "secret" ]; then
+                echo "::warning::未配置仓库密钥 CRX_PRIVATE_KEY，改用临时密钥：扩展 ID 会与历史版本不同，Chrome 视为全新扩展、无法原地升级。"
+              else
+                echo "::warning::已选择临时生成签名密钥（SIGN_MODE=generate），仅建议用于测试。"
+              fi
+              rm -f .cnb-build/key.pem
+              echo "临时密钥不会上传到任何位置（公开仓库附件可被任何人下载）"
+            fi
+
+        - name: 构建 zip 与 CRX3
+          script: |
+            set -euo pipefail
+            V=$(cat .cnb-build/version)
+            ARGS=(--src "$SOURCE_DIR" --name nonortc --version "$V" --out-dir dist --key .cnb-build/key.pem)
+            if [ "${SYNC_MANIFEST:-true}" != "true" ]; then
+              ARGS+=(--no-sync-manifest)
+            fi
+            python3 "$BUILD_SCRIPT" "${ARGS[@]}" | tee .cnb-build/build.json
+            python3 -c 'import json,sys; d=json.load(open(".cnb-build/build.json")); print("扩展 ID:", d["extension_id"]); print("打包文件数:", d["files"])'
+
+        - name: 校验产物
+          script: |
+            set -euo pipefail
+            python3 - <<'PY'
+            import io, os, struct, sys, zipfile
+            sys.path.insert(0, os.path.dirname(os.environ.get('BUILD_SCRIPT', '.github/scripts/build.py')))
+            import build as B
+
+            crx_path = [os.path.join('dist', f) for f in os.listdir('dist') if f.endswith('.crx')][0]
+            zip_path = [os.path.join('dist', f) for f in os.listdir('dist') if f.endswith('.zip')][0]
+            crx = open(crx_path, 'rb').read()
+            assert crx[:4] == b'Cr24', 'CRX magic 不符'
+            ver = struct.unpack('<I', crx[4:8])[0]
+            n = struct.unpack('<I', crx[8:12])[0]
+            assert ver == 3, 'CRX 版本应为 3，实际 %d' % ver
+            header, archive = crx[12:12 + n], crx[12 + n:]
+            for t in B.FORBIDDEN_TOKENS:
+                assert t not in header, 'header 含被 Chrome 拒绝的 ZIP token'
+            assert zipfile.ZipFile(io.BytesIO(archive)).testzip() is None
+            print('CRX3 校验通过：header=%d bytes, archive=%d bytes' % (n, len(archive)))
+
+            z = zipfile.ZipFile(zip_path)
+            assert z.testzip() is None
+            names = z.namelist()
+            assert any(x.endswith('manifest.json') for x in names), 'zip 内缺少 manifest.json'
+            assert not any(x.endswith('.pem') for x in names), 'zip 内不应包含私钥'
+            print('zip 校验通过：%d 个条目' % len(names))
+            PY
+            ls -lh dist
+
+        - name: 生成 Release 说明
+          script: |
+            set -euo pipefail
+            V=$(cat .cnb-build/version)
+            if [ -n "${RELEASE_NOTES:-}" ]; then
+              printf '%s\n' "$RELEASE_NOTES" > .cnb-build/notes.md
+            else
+              EXT_ID=$(python3 -c 'import json; print(json.load(open(".cnb-build/build.json"))["extension_id"])')
+              FILES=$(python3 -c 'import json; print(json.load(open(".cnb-build/build.json"))["files"])')
+              {
+                printf '## nonortc %s\n\n' "$VERSION"
+                printf '| 项 | 值 |\n'
+                printf '| --- | --- |\n'
+                printf '| 扩展 ID | `%s` |\n' "$EXT_ID"
+                printf '| 打包文件数 | %s |\n' "$FILES"
+                printf '| CRX 签名算法 | RSASSA-PKCS1-v1_5 / SHA-256 |\n\n'
+                printf '### 产物\n\n'
+                printf -- '- `nonortc-%s.zip` —— 解压后通过「加载已解压的扩展程序」安装\n' "$V"
+                printf -- '- `nonortc-%s.crx` —— CRX3，用于 Chrome Web Store 上架或企业策略分发\n' "$V"
+                printf -- '- `nonortc-%s-SHA256SUMS.txt` —— SHA-256 校验值\n' "$V"
+                printf -- '- `nonortc-%s-BUILD-INFO.txt` —— 构建信息（含扩展 ID）\n' "$V"
+              } > .cnb-build/notes.md
+            fi
+            cat .cnb-build/notes.md
+
+        - name: 创建 Git Tag
+          script: |
+            set -euo pipefail
+            git config user.name "cnb-pipeline"
+            git config user.email "cnb-pipeline@cnb.cool"
+            if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+              echo "远端 tag ${VERSION} 已存在，跳过创建"
+            else
+              git tag -a "$VERSION" -m "nonortc ${VERSION}"
+              if ! git push origin "$VERSION"; then
+                echo "ERROR: tag ${VERSION} 推送失败。请确认流水线具备仓库写权限，"
+                echo "或到仓库页面手动创建同名 Tag 后重新触发本流水线。"
+                exit 1
+              fi
+              echo "已创建并推送 tag ${VERSION}"
+            fi
+
+        - name: 创建 CNB Release
+          type: git:release
+          options:
+            tag: ${VERSION}
+            title: nonortc ${VERSION}
+            descriptionFromFile: .cnb-build/notes.md
+            preRelease: ${PRE_RELEASE}
+            latest: ${LATEST}
+            overlying: false
+
+        - name: 上传 Release 附件
+          image: cnbcool/attachments:latest
+          settings:
+            type: UPLOAD
+            tag: ${VERSION}
+            attachments:
+              - "./dist/*.zip"
+              - "./dist/*.crx"
+              - "./dist/*-SHA256SUMS.txt"
+              - "./dist/*-BUILD-INFO.txt"
+
+        # 构建产物同时挂到本次 commit，随代码仓库留存（等同制品归档，ttl 缺省为永久）
+        # 如不需要，删除本 stage 即可
+        - name: 归档构建产物到 commit
+          image: cnbcool/attachments:latest
+          settings:
+            type: UPLOAD
+            commit: ${CNB_COMMIT}
+            attachments:
+              - "./dist/*.zip"
+              - "./dist/*.crx"
+              - "./dist/*-SHA256SUMS.txt"
+              - "./dist/*-BUILD-INFO.txt"
+
+        - name: 输出摘要并清理私钥
+          script: |
+            set -euo pipefail
+            python3 -c 'import json; d=json.load(open(".cnb-build/build.json")); print("扩展 ID:", d["extension_id"]); print("zip:", d["zip"]); print("crx:", d["crx"])'
+            echo "----- SHA256 -----"
+            cat dist/*-SHA256SUMS.txt
+            echo "----- Release -----"
+            echo "https://cnb.cool/${CNB_REPO_SLUG}/-/releases/${VERSION}"
+            shred -u .cnb-build/key.pem 2>/dev/null || rm -f .cnb-build/key.pem
+            echo "已清理本地私钥副本"

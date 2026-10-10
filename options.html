@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nonortc 高级设置</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
+    h1 { font-size: 20px; }
+    .card { border: 1px solid #e2e2e2; border-radius: 8px; padding: 16px 18px; margin-bottom: 16px; }
+    .card h2 { font-size: 15px; margin: 0 0 12px; }
+    label { font-size: 13px; display: block; margin: 10px 0 4px; }
+    select, input[type=text] { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; box-sizing: border-box; }
+    .hint { font-size: 12px; color: #888; margin-top: 4px; }
+    button { background: #2b7de9; color: #fff; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    button.secondary { background: #eee; color: #333; }
+    .row { display: flex; gap: 12px; align-items: flex-end; }
+    .row > div { flex: 1; }
+    .savebar { position: sticky; bottom: 0; background: #fff; padding: 12px 0; border-top: 1px solid #eee; margin-top: 8px; }
+    .status { font-size: 12px; color: #1e7e34; margin-left: 10px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
+    .pill { display:inline-block; padding:1px 6px; border-radius:4px; font-size:11px; }
+    .pill.on { background:#e6f4ea; color:#1e7e34; }
+    .pill.off { background:#fdecea; color:#c0392b; }
+    .chk { display:flex; align-items:center; gap:6px; font-size:13px; margin-top:12px; }
+    .chk input { width:auto; }
+    .hint.warn { color:#b9770e; }
+  </style>
+</head>
+<body>
+  <h1>nonortc 高级设置</h1>
+
+  <div class="card">
+    <h2>代理时区（伪造时区，匹配代理出口）</h2>
+    <div class="row">
+      <div>
+        <label>IANA 时区（可输入关键字过滤）</label>
+        <input type="text" id="tz" list="tzList" placeholder="如 America/Los_Angeles" autocomplete="off">
+        <datalist id="tzList"></datalist>
+        <div class="hint">网站将读到此时区，而非宿主机真实时区。应与代理出口 IP 所在城市一致，否则检测工具会判「时区不一致」。</div>
+      </div>
+      <div style="flex:0 0 auto;">
+        <label>&nbsp;</label>
+        <button class="secondary" id="detectBtn" type="button">自动探测</button>
+      </div>
+    </div>
+    <label class="chk"><input type="checkbox" id="autoDetectTz"> 自动匹配代理时区（联网探测出口 IP 的时区与坐标，开启后随浏览器启动并每小时校正一次）</label>
+    <div class="hint" id="detectHint">自动探测会按当前出口 IP 依次查询多个 geo-IP 数据源（按需触发；开启「自动匹配」后为定时外联）。</div>
+  </div>
+
+  <div class="card">
+    <h2>WebRTC IP 处理策略</h2>
+    <label>策略取值</label>
+    <select id="webrtcPolicy">
+      <option value="disable_non_proxied_udp">disable_non_proxied_udp（代理场景推荐：强制走代理）</option>
+      <option value="default_public_interface_only">default_public_interface_only（仅公网接口，丢弃私有地址）</option>
+    </select>
+    <div class="hint">关闭全局防护时自动恢复为 default。真实 IP / DNS 泄漏防护依赖此项。</div>
+  </div>
+
+  <div class="card">
+    <h2>地理定位防护</h2>
+    <label>模式</label>
+    <select id="geoMode">
+      <option value="spoof">伪造坐标（返回与代理时区地区一致的坐标）</option>
+      <option value="deny">静默拒绝（总是 deny）</option>
+    </select>
+    <div class="row" style="margin-top:10px;">
+      <div>
+        <label>伪造纬度（可选，留空则用地区默认）</label>
+        <input type="text" id="geoLat" placeholder="如 40.7128">
+      </div>
+      <div>
+        <label>伪造经度（可选）</label>
+        <input type="text" id="geoLng" placeholder="如 -74.0060">
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>语言环境防护</h2>
+    <label>对网站统一返回的语言</label>
+    <select id="language">
+      <option value="en-US">en-US（英文，推荐）</option>
+      <option value="en-GB">en-GB</option>
+      <option value="en">en</option>
+    </select>
+    <div class="hint">同时改写 navigator.language / languages 与 HTTP Accept-Language 请求头。</div>
+  </div>
+
+  <div class="card">
+    <h2>按站点例外（仅作用于 时区 / 语言 / 地理定位）</h2>
+    <div class="hint">站点默认跟随全局开关：全局开启时默认受防护，全局关闭时默认不受防护。下方列出偏离默认的例外站点（「仅本站防护」= 全局关闭时仍单独保护；「已放行」= 全局开启时单独跳过）。WebRTC / DNS / 真实IP 不受此项影响，始终由全局开关独占控制。</div>
+    <table id="siteTable">
+      <thead><tr><th>主机</th><th>状态</th><th></th></tr></thead>
+      <tbody id="siteBody"></tbody>
+    </table>
+  </div>
+
+  <div class="savebar">
+    <button id="saveBtn" type="button">保存设置</button>
+    <button class="secondary" id="selftestBtn" type="button">打开泄漏自检页</button>
+    <span class="status" id="saveStatus"></span>
+  </div>
+
+  <script src="geoip.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

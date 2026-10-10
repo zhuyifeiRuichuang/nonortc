@@ -1,0 +1,8 @@
+# CNB（cnb.cool）流水线入口。
+# CNB 要求配置文件固定为仓库根的 .cnb.yml，因此这里只做引用，
+# 真正的流水线定义集中在 .cnb/ 目录，便于与 .github/ 分离维护。
+#
+# include 支持本地相对路径（相对仓库根目录），语法见官方文档：
+# https://docs.cnb.cool/zh/file-reference.html
+include:
+  - ./.cnb/release.yml

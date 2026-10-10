@@ -1,0 +1,69 @@
+# CNB 手动触发按钮配置。
+# 固定路径 .cnb/web_trigger.yml，不支持 include / imports 语法。
+# 按钮显示在「代码 - 分支详情页」，点击后触发 web_trigger_release 事件，
+# 该事件对应的流水线定义在 .cnb/release.yml。
+# 语法来源：https://docs.cnb.cool/zh/build/web-trigger.html
+branch:
+  - buttons:
+      - name: 打包并发布 nonortc
+        description: 填写版本号，构建 zip 与 CRX3，发布到本仓库 Release
+        event: web_trigger_release
+        isDefault: true
+        permissions:
+          roles:
+            - owner
+            - master
+            - developer
+        inputs:
+          - name: 基础配置
+            collapsed: false
+            inputs:
+              VERSION:
+                name: 版本号（同时作为 Release 的 Tag）
+                description: 建议填 v1.4.2；也可填 1.4.2（Tag 则不带 v）
+                type: input
+                required: true
+                placeholder: v1.4.2
+              SIGN_MODE:
+                name: CRX 签名密钥来源
+                description: secret = 复用仓库密钥 CRX_PRIVATE_KEY（扩展 ID 稳定）；generate = 临时生成（仅测试）
+                type: select
+                default: secret
+                options:
+                  - name: 复用仓库密钥（推荐）
+                    value: secret
+                  - name: 临时生成（仅测试，ID 每次都变）
+                    value: generate
+              SYNC_MANIFEST:
+                name: 把版本号写入产物内 manifest.json
+                type: switch
+                default: "true"
+                options:
+                  - name: 开启
+                    value: "true"
+                  - name: 关闭
+                    value: "false"
+          - name: 发布选项
+            collapsed: true
+            inputs:
+              RELEASE_NOTES:
+                name: Release 说明（Markdown，留空自动生成）
+                type: textarea
+              PRE_RELEASE:
+                name: 标记为预发布
+                type: switch
+                default: "false"
+                options:
+                  - name: 是
+                    value: "true"
+                  - name: 否
+                    value: "false"
+              LATEST:
+                name: 设为最新版本
+                type: switch
+                default: "true"
+                options:
+                  - name: 是
+                    value: "true"
+                  - name: 否
+                    value: "false"

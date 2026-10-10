@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nonortc 泄漏自检页</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; background: #f5f6f8; color: #1f2329; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .sub { color: #6b7280; font-size: 13px; margin-bottom: 20px; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+    .card h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #f0f1f3; vertical-align: top; }
+    th { color: #6b7280; font-weight: 600; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+    .pass { background: #e7f7ec; color: #1a7f37; }
+    .fail { background: #fdecec; color: #c0392b; }
+    .warn { background: #fff4e5; color: #b9770e; }
+    .info { background: #eef2ff; color: #3b5bdb; }
+    code { background: #f0f1f3; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    .btn { display: inline-block; margin-top: 6px; padding: 7px 14px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; }
+    .btn.sec { background: #fff; color: #2563eb; border: 1px solid #c7d2fe; }
+    .note { font-size: 12px; color: #6b7280; line-height: 1.6; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .err-card { background: #fff5f5; border-color: #f5c2c7; }
+    .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  </style>
+</head>
+<body>
+  <div class="head">
+    <h1>nonortc 泄漏自检页</h1>
+    <button class="btn sec" id="rerun" style="margin:0">重新检测</button>
+  </div>
+  <div class="sub">核对扩展各项防护是否真正生效。本页在扩展内部运行，可实读 <code>chrome.privacy</code> 与应用中的 DNR 规则；时区/语言/地理定位采用与内容脚本同款覆盖逻辑进行复刻验证。<span id="ver"></span>刷新后若某项长期停在「检测中」，按 <code>Ctrl+Shift+R</code> 硬性刷新一次（浏览器会缓存扩展页面资源），或到 <code>chrome://extensions</code> 重新加载本扩展。</div>
+
+  <div class="card">
+    <h2>① 全局策略落地核对 <span class="badge info">扩展内部可读</span></h2>
+    <table id="policyTable"><tbody><tr><td colspan="3" class="note">检测中…</td></tr></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>② 语言请求头改写规则 <span class="badge info">DNR 动态规则</span></h2>
+    <table id="dnrTable"><tbody><tr><td colspan="3" class="note">检测中…</td></tr></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>③ 时区 / 语言 / 地理定位覆盖验证 <span class="badge info">复刻注入效果</span></h2>
+    <div class="note">时区 / 语言：在本页复刻内容脚本的同款覆盖逻辑并读取观测值。地理定位：仅<b>复刻覆盖语义</b>（在内存里驱动一遍回调），<b>不调用真实 <code>navigator.geolocation</code></b> —— 本扩展未声明 <code>geolocation</code> 权限，扩展页调用按官方文档会立即以 <code>code 1</code> 失败，同时使 Chrome 在 <code>chrome://extensions</code> 记一条「Is the 'geolocation' permission appropriate?」<b>警告（warning 级，非错误）</b>，对判定毫无信息量。</div>
+    <table id="spoofTable"><tbody><tr><td colspan="3" class="note">检测中…</td></tr></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>④-a 真实网页 ICE 实测 <span class="badge pass">唯一有证据力的判定轨</span></h2>
+    <div class="note">取样跑在 <b>普通网页</b> 里：向每个已打开的 <code>http/https</code> 网页注入隔离世界探针，枚举该页面真实可见的 ICE 候选。取样环境与页面同源、同权限、同网络栈（ICE 候选由浏览器网络栈产生，与 JS 世界无关），且隔离世界原型链独立、页面脚本无法篡改。</div>
+    <div class="note" style="margin-top:6px;"><b>判定口径</b>：出现明文私网 host 候选（<code>10.</code> / <code>192.168.</code> / <code>172.16-31.</code> / <code>127.</code> / <code>169.254.</code> / <code>100.64-127.</code>）→ <b>FAIL</b>；仅有 mDNS 遮蔽的 <code>*.local</code> 候选 → 全局开启时应为 <b>WARN</b>（策略未落地），全局关闭时属正常；<b>0 条候选</b> → <code>disable_non_proxied_udp</code> 已抑制非代理 UDP，本机地址不可见（代价是无代理环境下 WebRTC 不可用）；仅 relay 中继候选 → PASS。</div>
+    <div style="margin:10px 0 4px; display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn" id="probeTabs">重新取样</button>
+      <button class="btn sec" id="openWebrtc2">打开 browserleaks/webrtc 复核</button>
+    </div>
+    <table id="webrtcRealTable"><tbody><tr><td colspan="3" class="note">取样中…</td></tr></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>④-b 扩展页 ICE 对照 <span class="badge warn">特权来源，不作判定</span></h2>
+    <div class="note">本卡片在扩展页自身枚举候选。实测（Chrome 154，有头 / 无头一致）：<code>chrome-extension://</code> 属特权来源，Chrome 对其<b>既不施加 mDNS 主机名遮蔽，也不施加 <code>webRTCIPHandlingPolicy</code></b>，因此无论策略如何设置，这里恒会出现明文内网地址。这是浏览器对该来源的行为，<b>不是防护失效</b>，也不代表普通网页会泄漏 —— 防护效果请以 ④-a 为准。</div>
+    <table id="webrtcTable"><tbody><tr><td colspan="3" class="note">检测中…</td></tr></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>⑤ 外部真实站点复核</h2>
+    <div class="note">自检页运行于扩展内部，无法跨域读取普通网页。请在下列真实站点确认最终效果（切换配置后请刷新目标站点，以消除文档最早期读取的竞态）：</div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn" id="openTzLang">browserleaks 时区 / 语言</button>
+      <button class="btn sec" id="openIpTz">browserleaks IP 与时区对照</button>
+    </div>
+    <div class="note" style="margin-top:10px;">
+      <b>怎么看</b>：在页面内查找 <b>Timezone</b>、<b>Local Time</b>、<b>System Language</b> 等字段，其值应与你配置的代理时区 / 语言一致；再与页面显示的 <b>IP 归属城市</b>对照 —— 两者时区应当吻合。不吻合即「代理穿帮」：浏览器时区与出口 IP 属地对不上，是高级指纹最易识别的破绽。
+    </div>
+    <div class="note" style="margin-top:10px;">备选：<code>https://ipleak.net</code>（IP / DNS / WebRTC 一站式）、<code>https://browserleaks.com/geo</code>（地理定位 API）。</div>
+    <div class="note" style="margin-top:10px;">
+      <b>⚠ 已知边界</b>：browserleaks <code>/javascript</code> 页的 <b>iframe.contentWindow</b> 标签页读的是一个 <code>&lt;iframe sandbox="allow-same-origin"&gt;</code> 帧 —— 该帧的脚本执行被沙箱禁用，<b>内容脚本无法注入</b>，因此该标签页会显示宿主机真实时区 / 语言。这是 Chrome 层面的约束，任何基于 JS 覆盖的扩展都无法处理（实测已确认：普通 <code>about:blank</code>、<code>srcdoc</code>、<code>blob:</code> 帧均已覆盖）。<b>用 window 标签页（默认）核对才有意义。</b>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>⑥ 网络层泄漏：DNS / 直连 / IPv6 / QUIC <span class="badge warn">扩展无法修复</span></h2>
+    <div class="note">以下向量发生在操作系统 / 代理客户端的网络层。Chrome 未向扩展开放任何 DNS、路由或网卡控制 API，本扩展在架构上无法干预。若检测工具显示「DNS 泄漏」或读到你的真实 IPv4 / IPv6，请按下表在代理侧处理：</div>
+    <table>
+      <thead><tr><th style="width:22%">向量</th><th style="width:26%">典型现象</th><th>在代理 / 系统侧的处理</th></tr></thead>
+      <tbody>
+        <tr><td>DNS 递归泄漏</td><td>检测工具显示解析器为本地 ISP DNS</td><td>Clash/Mihomo：<code>enhanced-mode: fake-ip</code> + 加密上游(DoH/DoT) + 开启 TUN 与 <code>dns-hijack</code>；改后执行 <code>ipconfig /flushdns</code></td></tr>
+        <tr><td>分流直连</td><td>「中国出口 IPv4」显示本机真实 IP，而代理出口为境外</td><td>改用全局代理，或对目标域名强制 <code>PROXY</code> 并置于规则最前；用 TUN 全量接管</td></tr>
+        <tr><td>IPv6 泄漏</td><td>出现本机真实 IPv6</td><td>代理未接管 IPv6 时，在系统网卡关闭 IPv6；否则在代理侧配置 IPv6 接管</td></tr>
+        <tr><td>QUIC / HTTP3(UDP)</td><td>仅 TCP 的代理下，HTTP/3 连接绕过代理直连</td><td><code>chrome://flags/#enable-quic</code> 设为 <code>Disabled</code> 后重启；或使用支持 UDP 的代理</td></tr>
+      </tbody>
+    </table>
+    <div class="note" style="margin-top:10px;">说明：本扩展的 <code>disable_non_proxied_udp</code> 只约束 <b>WebRTC</b> 的 UDP，<b>不</b>约束 QUIC。完整说明见项目 <code>README.md</code>「网络层泄漏」一节。</div>
+    <div class="note" style="margin-top:10px;">判定标准：泄漏 ≠ DNS 与出口 IP 国家不一致。真正的泄漏是 DNS 查询被发给了<b>你不打算让其知道你访问了什么</b>的解析器 —— 即本地 ISP 解析器。它掌握你的真实线路，而你正用代理出口伪装位置，二者分离即为泄漏。</div>
+    <div class="note" style="margin-top:10px;"><b>本地闭环验证</b>（推荐，比第三方检测站更有证据力）：项目内含零依赖自检工具，直接向 Akamai 权威 DNS 反查「谁在替你做递归查询」—— DNS 查询天然无法被 HTTP 代理转发，因此这是最硬的证据。<br>
+      <code>python tools/dns-leak-check.py --expect-country US</code><br>
+      仅用 Python 标准库，无需 pip 安装；输出网络出口、网卡 DNS、实际递归解析器及归属、ECS 披露情况与判定。修复后复测的通过标准是：递归解析器不再是本机 ISP，且与代理出口一致。</div>
+    <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn sec" id="openDnsLeak">dnsleaktest DNS 泄漏</button>
+      <button class="btn sec" id="openBlDns">browserleaks DNS 泄漏</button>
+      <button class="btn sec" id="openClaudeIp">ip.net.coffee/claude 综合检测</button>
+      <button class="btn sec" id="openWebrtc">browserleaks WebRTC</button>
+    </div>
+  </div>
+
+  <script src="selftest.js?v=1.1.0"></script>
+</body>
+</html>

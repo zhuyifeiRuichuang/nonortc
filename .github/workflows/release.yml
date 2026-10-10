@@ -1,0 +1,280 @@
+name: 打包并发布 nonortc
+
+# 仅手动触发：在 Actions 页面点「Run workflow」并填写版本号
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 1.4.2，可带 v 前缀）'
+        required: true
+        type: string
+      source_dir:
+        description: '扩展源码目录（相对仓库根，需包含 manifest.json）'
+        required: false
+        default: '.'
+        type: string
+      release_notes:
+        description: 'Release 说明，支持 Markdown 多行（留空则自动生成）'
+        required: false
+        type: string
+      sync_manifest:
+        description: '把版本号写入产物内的 manifest.json（仓库文件不改动）'
+        required: false
+        default: true
+        type: boolean
+      sign_key:
+        description: 'CRX 签名密钥：secret = 复用仓库 Secret（推荐，扩展 ID 稳定）；generate = 临时生成（仅测试，ID 每次都变）'
+        required: false
+        default: 'secret'
+        type: choice
+        options:
+          - secret
+          - generate
+      draft:
+        description: '创建为草稿 Release（不公开）'
+        required: false
+        default: false
+        type: boolean
+      prerelease:
+        description: '标记为预发布'
+        required: false
+        default: false
+        type: boolean
+
+# 创建 git tag 与 Release 需要写权限
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建并发布
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析输入并校验版本号
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SOURCE_DIR: ${{ inputs.source_dir }}
+        run: |
+          set -euo pipefail
+          V="${INPUT_VERSION#v}"
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)?$'; then
+            echo "::error::版本号格式非法：$INPUT_VERSION（应为 1.4.2 或 v1.4.2）"
+            exit 1
+          fi
+          if [ ! -f "${INPUT_SOURCE_DIR}/manifest.json" ]; then
+            echo "::error::${INPUT_SOURCE_DIR}/manifest.json 不存在"
+            exit 1
+          fi
+          {
+            echo "version=$V"
+            echo "source_dir=$INPUT_SOURCE_DIR"
+            echo "tag=v$V"
+          } >> "$GITHUB_OUTPUT"
+          echo "构建版本：$V（源码目录：$INPUT_SOURCE_DIR）"
+
+      - name: 准备 CRX 签名私钥
+        id: key
+        env:
+          SIGN_MODE: ${{ inputs.sign_key }}
+          CRX_PRIVATE_KEY: ${{ secrets.CRX_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p .build
+          if [ "$SIGN_MODE" = "secret" ] && [ -n "${CRX_PRIVATE_KEY:-}" ]; then
+            printf '%s\n' "$CRX_PRIVATE_KEY" > .build/key.pem
+            if ! openssl rsa -in .build/key.pem -noout -check; then
+              echo "::error::Secret CRX_PRIVATE_KEY 不是有效的 RSA 私钥"
+              exit 1
+            fi
+            {
+              echo "path=$PWD/.build/key.pem"
+              echo "reused=true"
+            } >> "$GITHUB_OUTPUT"
+            echo "复用仓库 Secret 中的签名密钥（扩展 ID 保持稳定）"
+          else
+            if [ "$SIGN_MODE" = "secret" ]; then
+              echo "::warning::未配置 Secret CRX_PRIVATE_KEY，改用临时密钥：扩展 ID 会与历史版本不同，Chrome 会视为全新扩展、无法原地升级。"
+            else
+              echo "::warning::已选择临时生成签名密钥（sign_key=generate），仅建议用于测试；公开仓库请勿使用，私钥会被任何人下载。"
+            fi
+            rm -f .build/key.pem
+            {
+              echo "path=$PWD/.build/key.pem"
+              echo "reused=false"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 构建 zip 与 CRX3
+        id: build
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SOURCE_DIR: ${{ steps.meta.outputs.source_dir }}
+          KEY_PATH: ${{ steps.key.outputs.path }}
+          SYNC_MANIFEST: ${{ inputs.sync_manifest }}
+        run: |
+          set -euo pipefail
+          ARGS=(--src "$SOURCE_DIR" --name nonortc --version "$VERSION" --out-dir dist --key "$KEY_PATH")
+          if [ "$SYNC_MANIFEST" != "true" ]; then
+            ARGS+=(--no-sync-manifest)
+          fi
+          python3 .github/scripts/build.py "${ARGS[@]}" | tee .build/build.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          d = json.load(open('.build/build.json'))
+          print('extension_id=%s' % d['extension_id'])
+          print('zip=%s' % d['zip'])
+          print('crx=%s' % d['crx'])
+          print('file_count=%s' % d['files'])
+          PY
+          echo "扩展 ID：$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["extension_id"])' .build/build.json)"
+
+      - name: 校验产物（CRX3 结构与 zip 完整性）
+        env:
+          CRX_PATH: ${{ steps.build.outputs.crx }}
+          ZIP_PATH: ${{ steps.build.outputs.zip }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import io, json, os, struct, sys, zipfile
+          sys.path.insert(0, '.github/scripts')
+          import build as B
+
+          crx_path = os.environ['CRX_PATH']
+          zip_path = os.environ['ZIP_PATH']
+          crx = open(crx_path, 'rb').read()
+          assert crx[:4] == b'Cr24', 'CRX magic 不符'
+          ver = struct.unpack('<I', crx[4:8])[0]
+          n = struct.unpack('<I', crx[8:12])[0]
+          assert ver == 3, 'CRX 版本应为 3，实际 %d' % ver
+          header, archive = crx[12:12 + n], crx[12 + n:]
+          for t in B.FORBIDDEN_TOKENS:
+              assert t not in header, 'header 含被 Chrome 拒绝的 ZIP token %r' % (t,)
+          assert zipfile.ZipFile(io.BytesIO(archive)).testzip() is None
+          assert 'manifest.json' in zipfile.ZipFile(io.BytesIO(archive)).namelist()
+          print('CRX3 校验通过：header=%d bytes, archive=%d bytes' % (n, len(archive)))
+
+          z = zipfile.ZipFile(zip_path)
+          assert z.testzip() is None, 'zip 完整性校验失败'
+          names = z.namelist()
+          assert any(x.endswith('manifest.json') for x in names), 'zip 内缺少 manifest.json'
+          assert not any(x.endswith('.pem') for x in names), 'zip 内不应包含私钥文件'
+          print('zip 校验通过：%d 个条目' % len(names))
+          PY
+
+      - name: 上传制品（Artifacts）
+        uses: actions/upload-artifact@v4
+        with:
+          name: nonortc-v${{ steps.meta.outputs.version }}
+          path: |
+            dist/*.zip
+            dist/*.crx
+            dist/*-SHA256SUMS.txt
+            dist/*-BUILD-INFO.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 上传签名私钥（仅临时生成时）
+        if: steps.key.outputs.reused == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nonortc-v${{ steps.meta.outputs.version }}-signing-key
+          path: .build/key.pem
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 创建 Tag 并发布 Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          EXTENSION_ID: ${{ steps.build.outputs.extension_id }}
+          FILE_COUNT: ${{ steps.build.outputs.file_count }}
+          INPUT_NOTES: ${{ inputs.release_notes }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          ASSETS=(dist/*.zip dist/*.crx dist/*-SHA256SUMS.txt dist/*-BUILD-INFO.txt)
+
+          if [ -n "$INPUT_NOTES" ]; then
+            printf '%s\n' "$INPUT_NOTES" > .build/notes.md
+          else
+            {
+              printf '## nonortc v%s\n\n' "$VERSION"
+              printf '| 项 | 值 |\n'
+              printf '| --- | --- |\n'
+              printf '| 扩展 ID | `%s` |\n' "$EXTENSION_ID"
+              printf '| 打包文件数 | %s |\n' "$FILE_COUNT"
+              printf '| CRX 签名算法 | RSASSA-PKCS1-v1_5 / SHA-256 |\n\n'
+              printf '### 产物\n\n'
+              printf -- '- `nonortc-%s.zip` —— 解压后通过「加载已解压的扩展程序」安装\n' "$VERSION"
+              printf -- '- `nonortc-%s.crx` —— CRX3，用于 Chrome Web Store 上架或企业策略分发\n' "$VERSION"
+              printf -- '- `nonortc-%s-SHA256SUMS.txt` —— SHA-256 校验值\n' "$VERSION"
+              printf -- '- `nonortc-%s-BUILD-INFO.txt` —— 构建信息（含扩展 ID）\n' "$VERSION"
+            } > .build/notes.md
+          fi
+
+          FLAGS=()
+          if [ "$DRAFT" = "true" ]; then FLAGS+=(--draft); fi
+          if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，仅覆盖上传资产"
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              echo "远端 tag $TAG 已存在，跳过创建"
+            else
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git tag -a "$TAG" -m "nonortc v$VERSION"
+              git push origin "$TAG"
+            fi
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --title "nonortc v$VERSION" \
+              --notes-file .build/notes.md \
+              "${FLAGS[@]}"
+          fi
+          echo "url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: 输出构建摘要
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          EXTENSION_ID: ${{ steps.build.outputs.extension_id }}
+          FILE_COUNT: ${{ steps.build.outputs.file_count }}
+          KEY_REUSED: ${{ steps.key.outputs.reused }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## nonortc v$VERSION 构建完成"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 扩展 ID | \`$EXTENSION_ID\` |"
+            echo "| 打包文件数 | $FILE_COUNT |"
+            echo "| CRX 签名密钥 | $([ "$KEY_REUSED" = "true" ] && echo '复用 Secret（ID 稳定）' || echo '临时生成（ID 会变）') |"
+            echo "| Release | [v$VERSION]($RELEASE_URL) |"
+            echo ""
+            echo '```'
+            cat dist/*-SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 清理私钥
+        if: always()
+        run: |
+          set -euo pipefail
+          shred -u .build/key.pem 2>/dev/null || rm -f .build/key.pem
+          echo "已清理本地私钥副本"
