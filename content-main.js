@@ -30,6 +30,7 @@
 
   // ---- 捕获真实实现，用于未启用防护时透传 ----
   const REAL_TZ_OFFSET = Date.prototype.getTimezoneOffset;
+  const REAL_GET_TIME = Date.prototype.getTime;
   const REAL_DTF = Intl.DateTimeFormat;
   const REAL_LANG_DESC = Object.getOwnPropertyDescriptor(Navigator.prototype, 'language');
   const REAL_LANGS_DESC = Object.getOwnPropertyDescriptor(Navigator.prototype, 'languages');
@@ -65,8 +66,18 @@
     } catch (e) {}
   }
 
+  // 判定时间值是否有效（非 Invalid Date）。
+  // Intl.DateTimeFormat.prototype.formatToParts 按 ECMA-402 规定，对非有限时间值
+  // 抛出 RangeError；而 Date.prototype 的 toString/toTimeString/toDateString 对无效
+  // 日期按 ECMA-262 只返回字符串 "Invalid Date"、getTimezoneOffset 只返回 NaN。
+  // 覆盖时必须保留这一语义，否则会把原生「不抛错」的调用变成抛错，污染站点。
+  function isValidTime(date) {
+    return Number.isFinite(REAL_GET_TIME.call(date));
+  }
+
   // 计算某 IANA 时区相对 UTC 的偏移分钟数（与 Date.getTimezoneOffset 同语义：UTC - 本地）
   function tzOffsetMinutes(date, tz) {
+    if (!isValidTime(date)) return NaN; // 与原生 getTimezoneOffset 对无效日期的返回一致
     const dtf = new REAL_DTF('en-US', {
       timeZone: tz, hour12: false, hourCycle: 'h23',
       year: 'numeric', month: '2-digit', day: '2-digit',
@@ -235,18 +246,21 @@
         };
       }
 
+      // 无效日期（Invalid Date）必须原样透传：原生这三个方法返回 "Invalid Date"
+      // 而不抛错，若改走 Intl 便会抛 RangeError（实测 Chrome 报
+      // "Uncaught RangeError: Invalid time value"，站点因此收到未捕获异常）。
       Date.prototype.toString = function () {
-        if (!ACTIVE) return REAL_TO_STRING.call(this);
+        if (!ACTIVE || !isValidTime(this)) return REAL_TO_STRING.call(this);
         const p = tzParts(this);
         return `${p.wd} ${p.mon} ${p.day} ${p.yr} ${p.h}:${p.m}:${p.s} ${p.gmt} (${p.abbr})`;
       };
       Date.prototype.toTimeString = function () {
-        if (!ACTIVE) return REAL_TO_TIME_STRING.call(this);
+        if (!ACTIVE || !isValidTime(this)) return REAL_TO_TIME_STRING.call(this);
         const p = tzParts(this);
         return `${p.h}:${p.m}:${p.s} ${p.gmt} (${p.abbr})`;
       };
       Date.prototype.toDateString = function () {
-        if (!ACTIVE) return REAL_TO_DATE_STRING.call(this);
+        if (!ACTIVE || !isValidTime(this)) return REAL_TO_DATE_STRING.call(this);
         const p = tzParts(this);
         return `${p.wd} ${p.mon} ${p.day} ${p.yr}`;
       };

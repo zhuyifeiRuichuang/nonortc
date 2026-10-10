@@ -101,7 +101,10 @@ function isValidTZ(tz) {
 }
 
 // getTZOffset 语义：UTC - 本地（与 Date#getTimezoneOffset 相反）
+// 无效日期须返回 NaN：原生 getTimezoneOffset 对 Invalid Date 即返回 NaN，
+// 若继续走 Intl 会抛 RangeError（与 content-main.js 保持同一语义）。
 function tzOffsetMinutes(date, tz) {
+  if (!Number.isFinite(date.getTime())) return NaN;
   const dtf = new Intl.DateTimeFormat('en-US', {
     timeZone: tz, hour12: false, hourCycle: 'h23',
     year: 'numeric', month: '2-digit', day: '2-digit',
@@ -145,7 +148,9 @@ function applySpoofAndRead(tz, lang) {
   Date.prototype.toLocaleTimeString = function (l, o) {
     return _toLocaleTimeString.call(this, localesOf(l), Object.assign({}, o, { timeZone: tz }));
   };
+  const _toString = Date.prototype.toString;
   Date.prototype.toString = function () {
+    if (!Number.isFinite(this.getTime())) return _toString.call(this); // 无效日期原样透传
     const dtf = new REAL_DTF('en-US', {
       timeZone: tz, hour12: false, hourCycle: 'h23',
       weekday: 'short', year: 'numeric', month: 'short',
@@ -192,6 +197,16 @@ function applySpoofAndRead(tz, lang) {
     }
   } catch (e) { /* Temporal 不可用或属性不可重定义时保持原样，不影响其余向量 */ }
 
+  // 无效日期（Invalid Date）行为回归：原生 toString 返回 "Invalid Date"、
+  // getTimezoneOffset 返回 NaN，均不抛错。覆盖后必须保持，否则站点会收到
+  // "Uncaught RangeError: Invalid time value"（Chrome 实测，content-main.js 曾因此报错）。
+  let invalidThrew = false, invalidStr = '', invalidOff = '';
+  try {
+    const bad = new Date(NaN);
+    invalidStr = bad.toString();
+    invalidOff = String(bad.getTimezoneOffset());
+  } catch (e) { invalidThrew = true; invalidStr = e.name + ': ' + e.message; }
+
   const now = new Date();
   const off = now.getTimezoneOffset();
   let temporalId = '（浏览器不支持 Temporal）';
@@ -210,7 +225,8 @@ function applySpoofAndRead(tz, lang) {
     temporalId,
     lang: navigator.language,
     langs: navigator.languages.join(', '),
-    abbr: zoneAbbr(now, tz)
+    abbr: zoneAbbr(now, tz),
+    invalidThrew, invalidStr, invalidOff
   };
 }
 
@@ -630,6 +646,15 @@ async function main() {
     h += row('toLocaleString 排版', obs.localeStr ? 'pass' : 'fail', obs.localeStr);
     h += row('navigator.language', obs.lang === expectedLang ? 'pass' : 'fail', `观测=${obs.lang} / 期望=${expectedLang}`);
     h += row('navigator.languages', obs.langs.startsWith(expectedLang) ? 'pass' : 'fail', obs.langs);
+
+    // 回归项：覆盖不得改变 Invalid Date 的原生语义（原生不抛错，返回 "Invalid Date" 与 NaN）。
+    // 依据 ECMA-262：Date.prototype.toString 对 NaN 时间值返回 "Invalid Date"；
+    // 而 ECMA-402 的 Intl.DateTimeFormat.prototype.formatToParts 对非有限时间值抛 RangeError。
+    const okInvalid = !obs.invalidThrew && obs.invalidStr === 'Invalid Date' && obs.invalidOff === 'NaN';
+    h += row('无效日期透传', okInvalid ? 'pass' : 'fail',
+      okInvalid ? `new Date(NaN).toString()="${obs.invalidStr}"、getTimezoneOffset()=${obs.invalidOff}，与原生一致`
+        : `覆盖破坏了原生语义：${obs.invalidThrew ? '抛错 ' + obs.invalidStr
+          : `toString="${obs.invalidStr}" / getTimezoneOffset()=${obs.invalidOff}`}`);
 
     // Geolocation：复刻覆盖语义（不调用真实 API，避免产生 chrome://extensions 告警）
     const gc = geoReplicaCheck(STORE.geoMode || 'spoof', expectedTZ, STORE.geoCoords);
