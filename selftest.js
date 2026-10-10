@@ -2,7 +2,7 @@
 'use strict';
 
 // 与 manifest.json 的 version 保持一致；selftest.html 用 ?v= 引用本文件以避免缓存旧版
-const SELFTEST_VERSION = '1.1.0';
+const SELFTEST_VERSION = '1.1.1';
 
 /* ============ 0. 兜底：任何未捕获异常都必须可见，绝不留在「检测中」 ============ */
 

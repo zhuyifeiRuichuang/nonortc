@@ -1,31 +1,67 @@
 # =============================================================================
-# nonortc — CNB（cnb.cool）打包发布流水线
+# nonortc — CNB（cnb.cool）流水线定义
 #
-# 触发方式：仓库 → 代码 → 分支详情页 → 「打包并发布 nonortc」按钮
-#           （按钮定义见 .cnb/web_trigger.yml，事件 web_trigger_release）
-# 功能：手动填写版本号 → 构建 zip + CRX3 → 发布到本 CNB 代码仓库的 Release
+# 文件位置说明：CNB 强制要求入口配置为仓库根的 .cnb.yml，该文件通过 include
+# 引入本文件；真正的流水线内容集中在本文件，便于与 .github/ 下的配置分开维护。
 #
-# 打包脚本复用仓库内的 .github/scripts/build.py（纯 Python 标准库 + openssl，
-# 实现 CRX3 签名打包），两条流水线共用一份实现，避免双份维护。
+# 触发方式
+#   1. 推送代码到分支        → 代码校验（静态检查，不产出发布物）
+#   2. 分支详情页按钮「打包并发布 nonortc」 → 填版本号，构建 zip + CRX3 并发布 Release
+#   3. OpenAPI 触发 api_trigger_release    → 与页面按钮等价，版本号由请求参数传入
 #
-# 官方依据：
-#   - 手动触发 / inputs      https://docs.cnb.cool/zh/build/web-trigger.html
-#   - git:release 内置任务    https://docs.cnb.cool/zh/build/internal-steps/git/release.html
-#   - 附件插件 attachments    https://cnb.cool/cnb/plugins/cnbcool/attachments
-#   - 文件引用 include        https://docs.cnb.cool/zh/file-reference.html
+# 官方依据
+#   - 配置 schema   https://docs.cnb.cool/conf-schema-zh.json
+#   - 触发规则      https://docs.cnb.cool/zh/build/trigger-rule.html
+#   - 手动触发      https://docs.cnb.cool/zh/build/web-trigger.html
+#   - git:release   https://docs.cnb.cool/zh/build/internal-steps/git/release.html
+#   - 附件插件      https://cnb.cool/cnb/plugins/cnbcool/attachments
+#
+# 语法要点：流水线（Pipeline）级的构建环境只能写在 docker.image 下，
+#           Pipeline 不接受 image 字段；只有 Stage（任务）级可直接使用 image。
+#           本文件已按官方 schema 校验通过。
 # =============================================================================
 "**":
-  web_trigger_release:
+  # 事件一：推送校验。
+  # 必须显式声明镜像：CNB 平台默认构建环境只提供 git，不含 python3 与 node。
+  # 曾因依赖默认环境导致 verify.py 报 command not found（退出码 127）。
+  push:
+    - name: 代码校验
+      docker:
+        image: python:3.12-bookworm
+      stages:
+        - name: 校验扩展清单与文件引用
+          script: |
+            set -eu
+            python3 --version
+            python3 .github/scripts/verify.py
+        - name: 校验 JavaScript 语法
+          image: node:22
+          script: |
+            set -eu
+            node --version
+            count=0
+            for file in *.js; do
+              [ -f "$file" ] || continue
+              node --check "$file"
+              count=$((count + 1))
+            done
+            echo "JavaScript 语法检查通过：${count} 个文件"
+
+  # 事件二：页面按钮触发。
+  # 按钮定义在 .cnb/web_trigger.yml（event: web_trigger_release），显示在仓库
+  # 「代码 - 分支详情页」，页面表单填写的输入项会作为环境变量注入本流水线。
+  web_trigger_release: &release_job
     - name: 打包并发布 nonortc
       # 需要 python3 + openssl + git；Debian 版 python 镜像三者齐备
-      image: python:3.12-bookworm
+      docker:
+        image: python:3.12-bookworm
       env:
         BUILD_SCRIPT: .github/scripts/build.py
         SOURCE_DIR: .
       stages:
         - name: 环境自检与版本号校验
           script: |
-            set -euo pipefail
+            set -eu
             command -v python3 >/dev/null || { echo "ERROR: python3 不可用"; exit 1; }
             command -v openssl >/dev/null || { apt-get update -qq && apt-get install -y -qq openssl; }
             command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git; }
@@ -35,45 +71,58 @@
             fi
             V="${VERSION#v}"
             if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)?$'; then
-              echo "ERROR: 版本号格式非法：$VERSION（应为 1.4.2 或 v1.4.2）"
+              echo "ERROR: 版本号格式非法：$VERSION（应为 1.1.0 或 v1.1.0）"
               exit 1
             fi
             mkdir -p dist .cnb-build
             printf '%s' "$V" > .cnb-build/version
             echo "构建版本：$V    Release Tag：$VERSION"
 
+        # 扩展 ID 由签名公钥推导（SHA256(SPKI) 前 16 字节），换密钥即换 ID，
+        # Chrome 会视为全新扩展、无法原地升级。因此默认策略是「没有固定密钥就失败」，
+        # 而不是静默生成临时密钥——后者会产出一个 ID 错误、却看起来构建成功的产物。
+        # 仅当显式指定 SIGN_MODE=generate 时才允许临时密钥（用于联调测试）。
         - name: 准备 CRX 签名私钥
           script: |
-            set -euo pipefail
+            set -eu
             mkdir -p .cnb-build
-            if [ "${SIGN_MODE:-secret}" = "secret" ] && [ -n "${CRX_PRIVATE_KEY:-}" ]; then
-              printf '%s\n' "$CRX_PRIVATE_KEY" > .cnb-build/key.pem
-              openssl rsa -in .cnb-build/key.pem -noout -check
-              echo "复用仓库密钥 CRX_PRIVATE_KEY（扩展 ID 保持稳定）"
-            else
-              if [ "${SIGN_MODE:-secret}" = "secret" ]; then
-                echo "::warning::未配置仓库密钥 CRX_PRIVATE_KEY，改用临时密钥：扩展 ID 会与历史版本不同，Chrome 视为全新扩展、无法原地升级。"
-              else
-                echo "::warning::已选择临时生成签名密钥（SIGN_MODE=generate），仅建议用于测试。"
-              fi
+            if [ "${SIGN_MODE:-secret}" = "generate" ]; then
+              echo "::warning::SIGN_MODE=generate：本次使用临时密钥，扩展 ID 仅本次有效，不可用于发布"
               rm -f .cnb-build/key.pem
-              echo "临时密钥不会上传到任何位置（公开仓库附件可被任何人下载）"
+              exit 0
             fi
+            if [ -z "${CRX_PRIVATE_KEY:-}" ]; then
+              echo "ERROR: 未配置仓库密钥 CRX_PRIVATE_KEY，已中止发布"
+              echo "原因：扩展 ID 由签名公钥推导，临时密钥会产出与历史版本不同的 ID，"
+              echo "      Chrome 会将其视为全新扩展，用户无法原地升级。"
+              echo "配置路径：仓库 设置 → 变量与密钥 → 新建密钥"
+              echo "          名称 CRX_PRIVATE_KEY，值为 RSA 私钥 PEM 全文（含首尾标记行）"
+              echo "若仅需联调流水线，可临时设置 SIGN_MODE=generate"
+              exit 1
+            fi
+            printf '%s\n' "$CRX_PRIVATE_KEY" > .cnb-build/key.pem
+            if ! openssl rsa -in .cnb-build/key.pem -noout -check; then
+              echo "ERROR: CRX_PRIVATE_KEY 不是有效的 RSA 私钥，请检查换行是否完整"
+              exit 1
+            fi
+            echo "复用仓库密钥 CRX_PRIVATE_KEY（扩展 ID 保持稳定）"
 
         - name: 构建 zip 与 CRX3
           script: |
-            set -euo pipefail
+            set -eu
             V=$(cat .cnb-build/version)
-            ARGS=(--src "$SOURCE_DIR" --name nonortc --version "$V" --out-dir dist --key .cnb-build/key.pem)
-            if [ "${SYNC_MANIFEST:-true}" != "true" ]; then
-              ARGS+=(--no-sync-manifest)
+            if [ "${SYNC_MANIFEST:-true}" = "true" ]; then
+              python3 "$BUILD_SCRIPT" --src "$SOURCE_DIR" --name nonortc --version "$V" \
+                --out-dir dist --key .cnb-build/key.pem | tee .cnb-build/build.json
+            else
+              python3 "$BUILD_SCRIPT" --src "$SOURCE_DIR" --name nonortc --version "$V" \
+                --out-dir dist --key .cnb-build/key.pem --no-sync-manifest | tee .cnb-build/build.json
             fi
-            python3 "$BUILD_SCRIPT" "${ARGS[@]}" | tee .cnb-build/build.json
-            python3 -c 'import json,sys; d=json.load(open(".cnb-build/build.json")); print("扩展 ID:", d["extension_id"]); print("打包文件数:", d["files"])'
+            python3 -c 'import json; d=json.load(open(".cnb-build/build.json")); print("扩展 ID:", d["extension_id"]); print("打包文件数:", d["files"])'
 
         - name: 校验产物
           script: |
-            set -euo pipefail
+            set -eu
             python3 - <<'PY'
             import io, os, struct, sys, zipfile
             sys.path.insert(0, os.path.dirname(os.environ.get('BUILD_SCRIPT', '.github/scripts/build.py')))
@@ -103,7 +152,7 @@
 
         - name: 生成 Release 说明
           script: |
-            set -euo pipefail
+            set -eu
             V=$(cat .cnb-build/version)
             if [ -n "${RELEASE_NOTES:-}" ]; then
               printf '%s\n' "$RELEASE_NOTES" > .cnb-build/notes.md
@@ -128,7 +177,7 @@
 
         - name: 创建 Git Tag
           script: |
-            set -euo pipefail
+            set -eu
             git config user.name "cnb-pipeline"
             git config user.email "cnb-pipeline@cnb.cool"
             if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
@@ -145,12 +194,14 @@
 
         - name: 创建 CNB Release
           type: git:release
+          # preRelease 在官方 schema 中为 boolean，无法由表单字符串插值提供，
+          # 本扩展的发版均为正式版本，故固定为 false；latest 同理固定为 true。
           options:
             tag: ${VERSION}
             title: nonortc ${VERSION}
             descriptionFromFile: .cnb-build/notes.md
-            preRelease: ${PRE_RELEASE}
-            latest: ${LATEST}
+            preRelease: false
+            latest: true
             overlying: false
 
         - name: 上传 Release 附件
@@ -179,7 +230,7 @@
 
         - name: 输出摘要并清理私钥
           script: |
-            set -euo pipefail
+            set -eu
             python3 -c 'import json; d=json.load(open(".cnb-build/build.json")); print("扩展 ID:", d["extension_id"]); print("zip:", d["zip"]); print("crx:", d["crx"])'
             echo "----- SHA256 -----"
             cat dist/*-SHA256SUMS.txt
@@ -187,3 +238,17 @@
             echo "https://cnb.cool/${CNB_REPO_SLUG}/-/releases/${VERSION}"
             shred -u .cnb-build/key.pem 2>/dev/null || rm -f .cnb-build/key.pem
             echo "已清理本地私钥副本"
+
+  # 事件三：OpenAPI 触发。
+  # 事件名必须是 api_trigger 或以 api_trigger_ 开头，否则接口无法命中该流水线，
+  # 规则见 https://docs.cnb.cool/zh/build/trigger-rule.html 。
+  # 这里用同文件 YAML 锚点复用上面的作业定义，展开后与事件二完全等价。
+  # 调用示例（令牌需具备 repo-cnb-trigger:rw 权限）：
+  #   curl -X POST https://api.cnb.cool/zhuzhupower/nonortc/-/build/start \
+  #     -H "Authorization: Bearer $CNB_TOKEN" \
+  #     -H "Accept: application/vnd.cnb.api+json" \
+  #     -H "Content-Type: application/json" \
+  #     -d '{"branch":"main","event":"api_trigger_release",
+  #          "env":{"VERSION":"v1.1.1","SIGN_MODE":"secret","SYNC_MANIFEST":"true"}}'
+  # 注意：VERSION 等变量原本由页面表单提供，用接口触发时必须在 env 中显式给出。
+  api_trigger_release: *release_job

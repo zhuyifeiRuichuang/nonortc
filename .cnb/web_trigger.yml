@@ -1,7 +1,7 @@
 # CNB 手动触发按钮配置。
 # 固定路径 .cnb/web_trigger.yml，不支持 include / imports 语法。
 # 按钮显示在「代码 - 分支详情页」，点击后触发 web_trigger_release 事件，
-# 该事件对应的流水线定义在 .cnb/release.yml。
+# 该事件对应的流水线定义在 .cnb/pipeline.yml。
 # 语法来源：https://docs.cnb.cool/zh/build/web-trigger.html
 branch:
   - buttons:
@@ -19,11 +19,11 @@ branch:
             collapsed: false
             inputs:
               VERSION:
-                name: 版本号（同时作为 Release 的 Tag）
-                description: 建议填 v1.4.2；也可填 1.4.2（Tag 则不带 v）
+                name: 版本号，同时作为 Release 的 Tag
+                description: 建议填 v1.1.1；也可填 1.1.1，两者仅 Tag 名称不同
                 type: input
                 required: true
-                placeholder: v1.4.2
+                placeholder: v1.1.1
               SIGN_MODE:
                 name: CRX 签名密钥来源
                 description: secret = 复用仓库密钥 CRX_PRIVATE_KEY（扩展 ID 稳定）；generate = 临时生成（仅测试）
@@ -49,21 +49,3 @@ branch:
               RELEASE_NOTES:
                 name: Release 说明（Markdown，留空自动生成）
                 type: textarea
-              PRE_RELEASE:
-                name: 标记为预发布
-                type: switch
-                default: "false"
-                options:
-                  - name: 是
-                    value: "true"
-                  - name: 否
-                    value: "false"
-              LATEST:
-                name: 设为最新版本
-                type: switch
-                default: "true"
-                options:
-                  - name: 是
-                    value: "true"
-                  - name: 否
-                    value: "false"

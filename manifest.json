@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "nonortc",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "隐私防护扩展：WebRTC/DNS/真实IP/时区/语言/地理定位防护，支持全局与按站点开关。",
   "minimum_chrome_version": "121",
   "icons": {
