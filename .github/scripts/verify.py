@@ -14,9 +14,12 @@
     4. HTML 页面内引用的本地脚本、样式、图片是否存在
     5. 仓库中是否混入了不应入库的签名私钥与产物文件
     6. permissions / host_permissions 是否重复
+    7. key 字段（固定扩展 ID 的签名公钥）是否为合法 base64 SPKI，并推导扩展 ID
 """
 
+import base64
 import glob
+import hashlib
 import json
 import os
 import re
@@ -80,6 +83,36 @@ def check_icon_map(value, origin):
 VERSION_RE = re.compile(r"^\d{1,5}(\.\d{1,5}){0,3}$")
 
 
+def manifest_extension_id(mf):
+    """由 manifest.json 的 key 字段（base64 SPKI 公钥）推导扩展 ID；不可用时返回 None。"""
+    key = mf.get("key")
+    if not key:
+        return None
+    try:
+        der = base64.b64decode(key, validate=True)
+    except Exception as exc:
+        fail("manifest.json 的 key 字段不是合法 base64：%s" % exc)
+        return None
+    if len(der) < 100:
+        fail("manifest.json 的 key 字段解码后仅 %d 字节，不是有效的 SPKI 公钥" % len(der))
+        return None
+    digest = hashlib.sha256(der).hexdigest()[:32]
+    return "".join(chr(ord("a") + int(c, 16)) for c in digest)
+
+
+def check_manifest_key(mf):
+    ext_id = manifest_extension_id(mf)
+    if ext_id is None:
+        if not mf.get("key"):
+            warn(
+                "manifest.json 未声明 key 字段：解压安装的扩展 ID 会随目录路径变化，"
+                "与 CRX3 安装得到的 ID 不一致，两个渠道无法互相覆盖升级"
+            )
+        return
+    if not re.fullmatch(r"[a-p]{32}", ext_id):
+        fail("由 key 字段推导出的扩展 ID 形态异常：%s" % ext_id)
+
+
 def check_manifest():
     manifest_path = os.path.join(ROOT, "manifest.json")
     if not os.path.isfile(manifest_path):
@@ -109,6 +142,8 @@ def check_manifest():
         warn("manifest.json 未声明 minimum_chrome_version")
     elif not re.match(r"^\d+$", str(min_chrome)):
         warn("minimum_chrome_version 建议使用纯数字主版本号：%s" % min_chrome)
+
+    check_manifest_key(mf)
 
     check_icon_map(mf.get("icons"), "icons")
 
@@ -265,6 +300,8 @@ def main():
         print("清单版本           : %s" % mf.get("manifest_version"))
         print("最低 Chrome 版本   : %s" % mf.get("minimum_chrome_version"))
         print("权限项             : %d 个" % len(mf.get("permissions") or []))
+        ext_id = manifest_extension_id(mf)
+        print("扩展 ID            : %s" % (ext_id or "未声明 key 字段（ID 不固定）"))
     print("HTML 页面          : %d 个" % html_count)
     print("JavaScript 文件    : %d 个" % len(js_files))
     print("文件引用校验       : %d 处" % CHECKED)

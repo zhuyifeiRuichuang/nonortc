@@ -20,6 +20,7 @@ CRX3 格式依据（三处独立来源相互印证）：
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -112,6 +113,31 @@ def ext_id_from_pub(pub_der: bytes) -> str:
     """扩展 ID：SHA256(SPKI DER) 前 16 字节，十六进制后 0-f 映射为 a-p。"""
     digest = hashlib.sha256(pub_der).hexdigest()[:32]
     return "".join(chr(ord("a") + int(c, 16)) for c in digest)
+
+
+def pub_der_from_manifest_key(manifest_text: str) -> bytes:
+    """取 manifest.json 的 key 字段（base64 的 SPKI DER 公钥）并解码。
+
+    Chrome 在安装未签名（解压）扩展时，用该字段确定扩展 ID；有它才能让
+    「解压安装」与「CRX3 安装」落在同一个扩展 ID 上，从而可以互相覆盖升级。
+    """
+    try:
+        manifest = json.loads(manifest_text)
+    except Exception as e:
+        die("解析 manifest.json 失败: %s" % e)
+    key_b64 = manifest.get("key")
+    if not key_b64:
+        die(
+            "manifest.json 缺少 key 字段：仅构建 zip 时，扩展 ID 只能由该字段推导。\n"
+            "生成方式：openssl rsa -in <私钥> -pubout -outform DER | base64 -w0"
+        )
+    try:
+        der = base64.b64decode(key_b64, validate=True)
+    except Exception as e:
+        die("manifest.json 的 key 字段不是合法 base64: %s" % e)
+    if len(der) < 100:
+        die("manifest.json 的 key 字段解码后仅 %d 字节，不是有效的 SPKI 公钥" % len(der))
+    return der
 
 
 # openssl 辅助
@@ -253,6 +279,7 @@ def pack_crx(archive: bytes, key_path: str, out_path: str) -> dict:
         "crx_id": ext_id_from_pub(pub_der),
         "header_size": len(header),
         "public_key_der": len(pub_der),
+        "public_key_der_bytes": pub_der,
         "signature": len(signature),
     }
 
@@ -279,6 +306,12 @@ def main() -> int:
         "--no-sync-manifest",
         action="store_true",
         help="不把 --version 写入产物内的 manifest.json",
+    )
+    ap.add_argument(
+        "--no-crx",
+        action="store_true",
+        help="只构建 zip（不生成 CRX3，无需签名私钥）；扩展 ID 改由 manifest.json 的 key 字段推导。"
+        "适用于无法提供私钥的构建环境。",
     )
     args = ap.parse_args()
 
@@ -317,29 +350,68 @@ def main() -> int:
 
     base = "%s-%s" % (args.name, version)
     zip_path = os.path.join(out_dir, base + ".zip")
-    crx_path = os.path.join(out_dir, base + ".crx")
-    flat_zip = os.path.join(out_dir, ".flat-archive.zip")
 
     # 1) 发布用 zip：顶层带 <name>/ 目录，解压后即得扩展目录
     make_zip(src, entries, zip_path, prefix=args.name + "/", manifest_patch=patch)
-    # 2) CRX 归档：扁平结构（解压后直接是 manifest.json）
-    make_zip(src, entries, flat_zip, prefix="", manifest_patch=patch)
 
-    key_path = os.path.abspath(args.key) if args.key else os.path.join(out_dir, args.name + ".pem")
-    key_existed = os.path.isfile(key_path)
-    with open(flat_zip, "rb") as f:
-        archive = f.read()
-    info = pack_crx(archive, key_path, crx_path)
-    os.remove(flat_zip)
+    # 产物内 manifest.json 的最终内容（含版本号同步后的结果）
+    with open(manifest_path, "rb") as f:
+        manifest_data = f.read()
+    if patch is not None:
+        manifest_data = patch(manifest_data)
+    manifest_text = manifest_data.decode("utf-8")
 
-    if not key_existed:
+    if args.no_crx:
+        # 仅构建 zip：无签名私钥，扩展 ID 只能由 manifest.json 的 key 字段推导
+        pub_der = pub_der_from_manifest_key(manifest_text)
+        ext_id = ext_id_from_pub(pub_der)
+        crx_path = None
+        key_path = None
+        key_existed = False
         sys.stderr.write(
-            "WARN: 未指定签名私钥，已新生成 %s。后续版本必须复用同一把密钥，"
-            "否则扩展 ID 会变化、Chrome 视为不同扩展无法升级。\n" % key_path
+            "仅构建 zip：扩展 ID %s（来源 manifest.json 的 key 字段）\n" % ext_id
         )
+    else:
+        crx_path = os.path.join(out_dir, base + ".crx")
+        flat_zip = os.path.join(out_dir, ".flat-archive.zip")
+        # 2) CRX 归档：扁平结构（解压后直接是 manifest.json）
+        make_zip(src, entries, flat_zip, prefix="", manifest_patch=patch)
+
+        key_path = (
+            os.path.abspath(args.key) if args.key else os.path.join(out_dir, args.name + ".pem")
+        )
+        key_existed = os.path.isfile(key_path)
+        with open(flat_zip, "rb") as f:
+            archive = f.read()
+        info = pack_crx(archive, key_path, crx_path)
+        os.remove(flat_zip)
+
+        if not key_existed:
+            sys.stderr.write(
+                "WARN: 未指定签名私钥，已新生成 %s。后续版本必须复用同一把密钥，"
+                "否则扩展 ID 会变化、Chrome 视为不同扩展无法升级。\n" % key_path
+            )
+
+        # manifest.json 的 key 必须与签名公钥一致，否则 Chrome 会拒绝安装该 CRX3
+        manifest_key = json.loads(manifest_text).get("key")
+        if manifest_key:
+            try:
+                manifest_der = base64.b64decode(manifest_key, validate=True)
+            except Exception as e:
+                die("manifest.json 的 key 字段不是合法 base64: %s" % e)
+            if manifest_der != info["public_key_der_bytes"]:
+                die(
+                    "manifest.json 的 key 与签名私钥的公钥不一致：\n"
+                    "  manifest key 推导 ID = %s\n"
+                    "  签名私钥推导 ID   = %s\n"
+                    "Chrome 会以「Invalid key」拒绝安装该 CRX3，请先同步两者。"
+                    % (ext_id_from_pub(manifest_der), info["crx_id"])
+                )
+        ext_id = info["crx_id"]
 
     digest_lines = []
-    for p in (zip_path, crx_path):
+    targets = [zip_path] if crx_path is None else [zip_path, crx_path]
+    for p in targets:
         digest_lines.append("%s  %s" % (sha256_file(p), os.path.basename(p)))
     sums_path = os.path.join(out_dir, base + "-SHA256SUMS.txt")
     with open(sums_path, "w", encoding="utf-8", newline="\n") as f:
@@ -350,17 +422,22 @@ def main() -> int:
         f.write("name: %s\n" % args.name)
         f.write("version: %s\n" % version)
         f.write("manifest_version_in_repo: %s\n" % repo_version)
-        f.write("extension_id: %s\n" % info["crx_id"])
-        f.write("crx_header_size: %d\n" % info["header_size"])
-        f.write("sign_algorithm: RSASSA-PKCS1-v1_5 / SHA-256\n")
+        f.write("extension_id: %s\n" % ext_id)
+        if crx_path is None:
+            f.write("extension_id_source: manifest.json key\n")
+            f.write("crx: not built (zip only)\n")
+        else:
+            f.write("crx_header_size: %d\n" % info["header_size"])
+            f.write("sign_algorithm: RSASSA-PKCS1-v1_5 / SHA-256\n")
+            f.write("key_reused: %s\n" % ("yes" if key_existed else "no (newly generated)"))
         f.write("zip_sha256: %s\n" % sha256_file(zip_path))
-        f.write("crx_sha256: %s\n" % sha256_file(crx_path))
-        f.write("key_reused: %s\n" % ("yes" if key_existed else "no (newly generated)"))
+        if crx_path is not None:
+            f.write("crx_sha256: %s\n" % sha256_file(crx_path))
         f.write("files: %d\n" % len(entries))
 
     print(json.dumps({
         "version": version,
-        "extension_id": info["crx_id"],
+        "extension_id": ext_id,
         "zip": zip_path,
         "crx": crx_path,
         "sha256sums": sums_path,

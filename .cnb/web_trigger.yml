@@ -6,7 +6,7 @@
 branch:
   - buttons:
       - name: 打包并发布 nonortc
-        description: 填写版本号，构建 zip 与 CRX3，发布到本仓库 Release
+        description: 填写版本号，构建 zip 并发布到本仓库 Release（CRX3 见 GitHub Release）
         event: web_trigger_release
         isDefault: true
         permissions:
@@ -24,16 +24,6 @@ branch:
                 type: input
                 required: true
                 placeholder: v1.1.1
-              SIGN_MODE:
-                name: CRX 签名密钥来源
-                description: secret = 复用仓库密钥 CRX_PRIVATE_KEY（扩展 ID 稳定）；generate = 临时生成（仅测试）
-                type: select
-                default: secret
-                options:
-                  - name: 复用仓库密钥（推荐）
-                    value: secret
-                  - name: 临时生成（仅测试，ID 每次都变）
-                    value: generate
               SYNC_MANIFEST:
                 name: 把版本号写入产物内 manifest.json
                 type: switch

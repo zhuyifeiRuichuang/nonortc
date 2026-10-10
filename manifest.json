@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "nonortc",
   "version": "1.1.1",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA8yx8Jy261Ue0x5UuaY41qgECqLrTOI+L2GBsHbmWbL5rTHR3+/iObK6nrdSnmwrtHyhl2QLpIWEva+UKpbFmUmtRGzEEJG1WPmocwK52XG6YMkrZQmXYql/bMApbSfXYnQ/RxWC/Vo7seV3147ZbsFWDysCK+d3oZd/YycJ1hSSi0AGVgKbzVukV+d2B1YaT74xyBxA1kZuBrCsyVQgFR7ApixZlRcsonieKipgylg7Eg2KqHhLqWfTkW5OlxT04JyrfnSk5ujDiAPWCgLt24LgOl74MT2125I3iIdv5oD115HKwYg8JzuD9+8nRXcP7CJ+d6S0ti6LqNtHFgcnsQwIDAQAB",
   "description": "隐私防护扩展：WebRTC/DNS/真实IP/时区/语言/地理定位防护，支持全局与按站点开关。",
   "minimum_chrome_version": "121",
   "icons": {

@@ -6,8 +6,14 @@
 #
 # 触发方式
 #   1. 推送代码到分支        → 代码校验（静态检查，不产出发布物）
-#   2. 分支详情页按钮「打包并发布 nonortc」 → 填版本号，构建 zip + CRX3 并发布 Release
+#   2. 分支详情页按钮「打包并发布 nonortc」 → 填版本号，构建 zip 并发布 Release
 #   3. OpenAPI 触发 api_trigger_release    → 与页面按钮等价，版本号由请求参数传入
+#
+# 产物范围：本流水线只产出 zip。CRX3 需要签名私钥，而 CNB 上没有可用的密钥配置
+#           入口，临时密钥会产出与历史版本不同的扩展 ID（Chrome 视为全新扩展、
+#           无法原地升级）。zip 内 manifest.json 带 key 字段，解压安装的扩展 ID
+#           与 GitHub 侧 CRX3 一致，两个渠道可互相覆盖升级；CRX3 统一由 GitHub
+#           Release 提供。
 #
 # 官方依据
 #   - 配置 schema   https://docs.cnb.cool/conf-schema-zh.json
@@ -78,45 +84,38 @@
             printf '%s' "$V" > .cnb-build/version
             echo "构建版本：$V    Release Tag：$VERSION"
 
-        # 扩展 ID 由签名公钥推导（SHA256(SPKI) 前 16 字节），换密钥即换 ID，
-        # Chrome 会视为全新扩展、无法原地升级。因此默认策略是「没有固定密钥就失败」，
-        # 而不是静默生成临时密钥——后者会产出一个 ID 错误、却看起来构建成功的产物。
-        # 仅当显式指定 SIGN_MODE=generate 时才允许临时密钥（用于联调测试）。
-        - name: 准备 CRX 签名私钥
+        # CNB 侧只发布 zip，不产出 CRX3。
+        # 原因：CRX3 的扩展 ID 由签名私钥的公钥推导，而本仓库在 CNB 上没有可用的
+        # 密钥配置入口，只能临时生成密钥——那会产出与历史版本不同的 ID，Chrome 会
+        # 视为全新扩展、无法原地升级。zip 不含签名，扩展 ID 改由 manifest.json 的
+        # key 字段固定，与 GitHub 侧 CRX3 的 ID 完全一致，因此两边可以互相覆盖升级。
+        # CRX3 包统一从 GitHub Release 获取。
+        - name: 确认扩展 ID
           script: |
             set -eu
             mkdir -p .cnb-build
-            if [ "${SIGN_MODE:-secret}" = "generate" ]; then
-              echo "::warning::SIGN_MODE=generate：本次使用临时密钥，扩展 ID 仅本次有效，不可用于发布"
-              rm -f .cnb-build/key.pem
-              exit 0
-            fi
-            if [ -z "${CRX_PRIVATE_KEY:-}" ]; then
-              echo "ERROR: 未配置仓库密钥 CRX_PRIVATE_KEY，已中止发布"
-              echo "原因：扩展 ID 由签名公钥推导，临时密钥会产出与历史版本不同的 ID，"
-              echo "      Chrome 会将其视为全新扩展，用户无法原地升级。"
-              echo "配置路径：仓库 设置 → 变量与密钥 → 新建密钥"
-              echo "          名称 CRX_PRIVATE_KEY，值为 RSA 私钥 PEM 全文（含首尾标记行）"
-              echo "若仅需联调流水线，可临时设置 SIGN_MODE=generate"
-              exit 1
-            fi
-            printf '%s\n' "$CRX_PRIVATE_KEY" > .cnb-build/key.pem
-            if ! openssl rsa -in .cnb-build/key.pem -noout -check; then
-              echo "ERROR: CRX_PRIVATE_KEY 不是有效的 RSA 私钥，请检查换行是否完整"
-              exit 1
-            fi
-            echo "复用仓库密钥 CRX_PRIVATE_KEY（扩展 ID 保持稳定）"
+            python3 - <<'PY' > .cnb-build/extid
+            import base64, hashlib, json
+            m = json.loads(open('manifest.json', encoding='utf-8').read())
+            key = m.get('key')
+            if not key:
+                raise SystemExit('ERROR: manifest.json 缺少 key 字段，解压安装将无法固定扩展 ID')
+            der = base64.b64decode(key, validate=True)
+            h = hashlib.sha256(der).digest()[:16]
+            print(''.join(chr(ord('a') + (b >> 4)) + chr(ord('a') + (b & 0xF)) for b in h))
+            PY
+            echo "扩展 ID（由 manifest.json 的 key 字段推导）：$(cat .cnb-build/extid)"
 
-        - name: 构建 zip 与 CRX3
+        - name: 构建 zip
           script: |
             set -eu
             V=$(cat .cnb-build/version)
             if [ "${SYNC_MANIFEST:-true}" = "true" ]; then
               python3 "$BUILD_SCRIPT" --src "$SOURCE_DIR" --name nonortc --version "$V" \
-                --out-dir dist --key .cnb-build/key.pem | tee .cnb-build/build.json
+                --out-dir dist --no-crx | tee .cnb-build/build.json
             else
               python3 "$BUILD_SCRIPT" --src "$SOURCE_DIR" --name nonortc --version "$V" \
-                --out-dir dist --key .cnb-build/key.pem --no-sync-manifest | tee .cnb-build/build.json
+                --out-dir dist --no-crx --no-sync-manifest | tee .cnb-build/build.json
             fi
             python3 -c 'import json; d=json.load(open(".cnb-build/build.json")); print("扩展 ID:", d["extension_id"]); print("打包文件数:", d["files"])'
 
@@ -124,29 +123,31 @@
           script: |
             set -eu
             python3 - <<'PY'
-            import io, os, struct, sys, zipfile
-            sys.path.insert(0, os.path.dirname(os.environ.get('BUILD_SCRIPT', '.github/scripts/build.py')))
-            import build as B
+            import base64, hashlib, json, os, zipfile
 
-            crx_path = [os.path.join('dist', f) for f in os.listdir('dist') if f.endswith('.crx')][0]
-            zip_path = [os.path.join('dist', f) for f in os.listdir('dist') if f.endswith('.zip')][0]
-            crx = open(crx_path, 'rb').read()
-            assert crx[:4] == b'Cr24', 'CRX magic 不符'
-            ver = struct.unpack('<I', crx[4:8])[0]
-            n = struct.unpack('<I', crx[8:12])[0]
-            assert ver == 3, 'CRX 版本应为 3，实际 %d' % ver
-            header, archive = crx[12:12 + n], crx[12 + n:]
-            for t in B.FORBIDDEN_TOKENS:
-                assert t not in header, 'header 含被 Chrome 拒绝的 ZIP token'
-            assert zipfile.ZipFile(io.BytesIO(archive)).testzip() is None
-            print('CRX3 校验通过：header=%d bytes, archive=%d bytes' % (n, len(archive)))
+            entries = sorted(os.listdir('dist'))
+            assert not [f for f in entries if f.endswith('.crx')], 'dist 中不应出现 crx（CNB 侧只发布 zip）'
+            zip_path = [os.path.join('dist', f) for f in entries if f.endswith('.zip')][0]
 
             z = zipfile.ZipFile(zip_path)
             assert z.testzip() is None
             names = z.namelist()
             assert any(x.endswith('manifest.json') for x in names), 'zip 内缺少 manifest.json'
             assert not any(x.endswith('.pem') for x in names), 'zip 内不应包含私钥'
+
+            mf = json.loads(z.read([x for x in names if x.endswith('manifest.json')][0]).decode('utf-8'))
+            key = mf.get('key')
+            assert key, 'zip 内 manifest.json 缺少 key 字段（解压安装将无法固定扩展 ID）'
+            der = base64.b64decode(key, validate=True)
+            h = hashlib.sha256(der).digest()[:16]
+            ext_id = ''.join(chr(ord('a') + (b >> 4)) + chr(ord('a') + (b & 0xF)) for b in h)
+
+            expected = open('.cnb-build/extid', encoding='utf-8').read().strip()
+            assert ext_id == expected, '扩展 ID 与仓库 manifest.json 不一致：%s != %s' % (ext_id, expected)
+
             print('zip 校验通过：%d 个条目' % len(names))
+            print('扩展 ID：%s（与 GitHub 侧 CRX3 一致）' % ext_id)
+            print('产物内版本号：%s' % mf.get('version'))
             PY
             ls -lh dist
 
@@ -165,12 +166,16 @@
                 printf '| --- | --- |\n'
                 printf '| 扩展 ID | `%s` |\n' "$EXT_ID"
                 printf '| 打包文件数 | %s |\n' "$FILES"
-                printf '| CRX 签名算法 | RSASSA-PKCS1-v1_5 / SHA-256 |\n\n'
+                printf '| CRX3 签名包 | 本仓库不提供，见如下说明 |\n\n'
                 printf '### 产物\n\n'
                 printf -- '- `nonortc-%s.zip` —— 解压后通过「加载已解压的扩展程序」安装\n' "$V"
-                printf -- '- `nonortc-%s.crx` —— CRX3，用于 Chrome Web Store 上架或企业策略分发\n' "$V"
                 printf -- '- `nonortc-%s-SHA256SUMS.txt` —— SHA-256 校验值\n' "$V"
-                printf -- '- `nonortc-%s-BUILD-INFO.txt` —— 构建信息（含扩展 ID）\n' "$V"
+                printf -- '- `nonortc-%s-BUILD-INFO.txt` —— 构建信息（含扩展 ID）\n\n' "$V"
+                printf '### 关于 CRX3\n\n'
+                printf 'CRX3 的扩展 ID 由签名私钥的公钥推导，而本仓库在 CNB 上没有可用的密钥配置入口；\n'
+                printf '临时密钥会产出与历史版本不同的 ID，Chrome 会视为全新扩展、无法原地升级。\n'
+                printf '因此 CNB 侧只发布不含签名的 zip：zip 内 manifest.json 已带 key 字段，\n'
+                printf '解压安装得到的扩展 ID 与 GitHub 侧 CRX3 完全一致，两个渠道可互相覆盖升级。\n'
               } > .cnb-build/notes.md
             fi
             cat .cnb-build/notes.md
@@ -211,7 +216,6 @@
             tag: ${VERSION}
             attachments:
               - "./dist/*.zip"
-              - "./dist/*.crx"
               - "./dist/*-SHA256SUMS.txt"
               - "./dist/*-BUILD-INFO.txt"
 
@@ -224,20 +228,18 @@
             commit: ${CNB_COMMIT}
             attachments:
               - "./dist/*.zip"
-              - "./dist/*.crx"
               - "./dist/*-SHA256SUMS.txt"
               - "./dist/*-BUILD-INFO.txt"
 
-        - name: 输出摘要并清理私钥
+        - name: 输出摘要
           script: |
             set -eu
-            python3 -c 'import json; d=json.load(open(".cnb-build/build.json")); print("扩展 ID:", d["extension_id"]); print("zip:", d["zip"]); print("crx:", d["crx"])'
+            python3 -c 'import json; d=json.load(open(".cnb-build/build.json")); print("扩展 ID:", d["extension_id"]); print("zip:", d["zip"])'
             echo "----- SHA256 -----"
             cat dist/*-SHA256SUMS.txt
             echo "----- Release -----"
             echo "https://cnb.cool/${CNB_REPO_SLUG}/-/releases/${VERSION}"
-            shred -u .cnb-build/key.pem 2>/dev/null || rm -f .cnb-build/key.pem
-            echo "已清理本地私钥副本"
+            echo "CRX3 签名包请在 GitHub Release 获取（与上面的扩展 ID 一致）"
 
   # 事件三：OpenAPI 触发。
   # 事件名必须是 api_trigger 或以 api_trigger_ 开头，否则接口无法命中该流水线，
@@ -249,6 +251,6 @@
   #     -H "Accept: application/vnd.cnb.api+json" \
   #     -H "Content-Type: application/json" \
   #     -d '{"branch":"main","event":"api_trigger_release",
-  #          "env":{"VERSION":"v1.1.1","SIGN_MODE":"secret","SYNC_MANIFEST":"true"}}'
+  #          "env":{"VERSION":"v1.1.1","SYNC_MANIFEST":"true"}}'
   # 注意：VERSION 等变量原本由页面表单提供，用接口触发时必须在 env 中显式给出。
   api_trigger_release: *release_job

@@ -96,7 +96,9 @@ Chrome 规定注入**主世界**的内容脚本与宿主网页共享同一 JS �
 
 关于 CRX 包：Chrome 已禁止通过双击安装本地 `.crx`，本地安装统一走「加载已解压的扩展程序」。`.crx` 仅用于应用商店上架或企业策略分发。
 
-**迁移注意**：解压安装的扩展 ID 由目录路径推导。若更换了目录名，Chrome 会视为新扩展，需先移除旧扩展再加载新目录，且旧的本地配置不会继承。
+**迁移注意**：`manifest.json` 中已写入 `key` 字段（固定的签名公钥），因此扩展 ID 不再随安装目录路径变化，解压安装与 CRX3 安装落在同一个扩展 ID 上：更换目录名、或从 zip 安装与从 crx 安装之间互相覆盖，扩展 ID 都保持不变，本地配置可正常继承。
+
+**两个渠道的产物差异**：zip 不含签名，两个渠道内容完全一致；CRX3 需要签名私钥，仅在 GitHub Release 提供（原因见「签名密钥」章节）。
 
 ### 配置
 
@@ -217,10 +219,12 @@ python tools/dns-leak-check.py --json               # 机读输出
 
 两条流水线共用同一个打包脚本。发布必须显式触发，推送代码不会自动发版。
 
-| 平台 | 配置文件 | 触发方式 |
-| --- | --- | --- |
-| GitHub Actions | `.github/workflows/release.yml` | Actions 页选择工作流，点击运行 |
-| 腾讯 CNB | `.cnb.yml` 引入 `.cnb/pipeline.yml` | 分支推送自动校验；分支详情页按钮或开放接口执行发布 |
+| 平台 | 配置文件 | 触发方式 | 发布产物 |
+| --- | --- | --- | --- |
+| GitHub Actions | `.github/workflows/release.yml` | Actions 页选择工作流，点击运行 | zip、CRX3、SHA-256 校验文件、构建信息 |
+| 腾讯 CNB | `.cnb.yml` 引入 `.cnb/pipeline.yml` | 分支推送自动校验；分支详情页按钮或开放接口执行发布 | zip、SHA-256 校验文件、构建信息 |
+
+两条流水线的 zip 由同一脚本产出，内容逐字节一致；CRX3 需要签名私钥，仅在 GitHub 侧发布。
 
 #### 推送校验
 
@@ -244,16 +248,16 @@ curl -X POST https://api.cnb.cool/zhuzhupower/nonortc/-/build/start \
   -H "Accept: application/vnd.cnb.api+json" \
   -H "Content-Type: application/json" \
   -d '{"branch":"main","event":"api_trigger_release",
-       "env":{"VERSION":"<版本号>","SIGN_MODE":"secret","SYNC_MANIFEST":"true"}}'
+       "env":{"VERSION":"<版本号>","SYNC_MANIFEST":"true"}}'
 ```
 
 页面表单填写的输入项，改用接口触发时必须在 `env` 中显式给出，否则流水线会在版本校验阶段失败。事件名必须是 `api_trigger` 或以 `api_trigger_` 开头，这是接口的硬性限制。令牌需具备 `repo-cnb-trigger:rw` 权限才能调用该接口，若缺少会返回权限不匹配；流水线内含发布 Release 的步骤，因此还需要 `repo-release:rw`，仅具备代码读写权限的令牌无法完成发布。
 
-发布产物流向：zip 安装包、CRX3 安装包、SHA-256 校验文件、构建信息文件。GitHub 侧同时写入制品仓库与 Release，CNB 侧同时写入 Release 附件与提交附件。
+发布产物流向：GitHub 侧产出 zip 安装包、CRX3 安装包、SHA-256 校验文件与构建信息文件，同时写入制品仓库与 Release；CNB 侧产出 zip 安装包、SHA-256 校验文件与构建信息文件，写入 Release 附件与提交附件。CNB 侧不产出 CRX3，原因见下一节。
 
-### 签名密钥
+### 签名密钥与扩展 ID
 
-CRX 的扩展 ID 由签名公钥推导，**更换密钥等于更换扩展 ID**，已安装的扩展将无法原地升级。因此密钥必须在首次发布前确定并长期复用。
+扩展 ID 由签名公钥推导，**更换密钥等于更换扩展 ID**，已安装的扩展将无法原地升级。因此密钥必须在首次发布前确定并长期复用。
 
 ```bash
 openssl genrsa -out nonortc-signing-key.pem 2048     # 生成后离线保存，切勿提交
@@ -261,9 +265,22 @@ openssl rsa -in nonortc-signing-key.pem -pubout -outform DER \
   | openssl dgst -sha256 -binary | head -c 16 | xxd -p | tr '0-9a-f' 'a-p'
 ```
 
-第二条命令输出的三十二位字符即该密钥对应的扩展 ID，可用于核对密钥配置是否正确。生成后把私钥全文填入仓库密钥，变量名为 `CRX_PRIVATE_KEY`：GitHub 在 Settings 的 Secrets 中，CNB 在「设置 → 变量与密钥」中。CNB 的开放接口不提供密钥写入能力，该步骤只能在网页完成。
+第二条命令输出的三十二位字符即该密钥对应的扩展 ID，可用于核对密钥配置是否正确。
 
-未配置该密钥时，发布流水线会在「准备 CRX 签名私钥」阶段直接失败并中止，不产出任何发布物。原因是临时密钥会生成与历史版本不同的扩展 ID，产出一个构建状态为成功、却无法让用户原地升级的安装包，属于必须拦截的错误。仅当联调流水线时，可将 `SIGN_MODE` 设为 `generate` 显式使用临时密钥。
+**私钥存放位置**：GitHub 在 Settings 的 Secrets 中，变量名 `CRX_PRIVATE_KEY`。腾讯 CNB 没有可用的密钥配置入口——仓库「设置」下没有「变量与密钥」，开放接口也没有任何密钥写入端点——因此 CNB 侧不产出 CRX3。
+
+**两端的产物策略差异**：
+
+- GitHub 侧用私钥签名产出 CRX3，构建脚本会校验 `manifest.json` 的 `key` 字段与签名公钥一致，不一致时直接失败（不一致的包会被 Chrome 以 `Invalid key` 拒绝安装）。
+- CNB 侧只产出 zip。zip 不含签名，扩展 ID 改由 `manifest.json` 的 `key` 字段推导，因此两个渠道安装得到的扩展 ID 完全相同，可以互相覆盖升级。CRX3 统一从 GitHub Release 获取。
+
+`manifest.json` 的 `key` 字段来自同一个签名公钥，生成方式：
+
+```bash
+openssl rsa -in nonortc-signing-key.pem -pubout -outform DER | base64 -w0
+```
+
+把输出整行填入 `manifest.json` 的 `key` 字段即可。该字段是公钥，可以公开，也不影响 CRX3 的签名校验。
 
 `.gitignore` 已排除 `*.pem`、`*.crx`、`*.zip` 与构建目录，私钥不会随提交入库。
 
