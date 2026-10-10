@@ -76,8 +76,8 @@ Chrome 规定注入**主世界**的内容脚本与宿主网页共享同一 JS �
 | `selftest.html` / `selftest.js` | 内置泄漏自检页 |
 | `icons/` | 扩展图标，四档尺寸，圆角透明底 |
 | `tools/dns-leak-check.py` | 本机 DNS 泄漏闭环验证工具，零第三方依赖，不打包进安装包 |
-| `.github/` | GitHub 打包发布流水线与打包脚本 |
-| `.cnb/` | CNB 打包发布流水线，与 GitHub 版共用同一个打包脚本 |
+| `.github/` | GitHub 打包发布流水线、打包脚本与清单校验脚本 |
+| `.cnb/` | CNB 流水线定义与手动触发按钮，与 GitHub 版共用同一套脚本 |
 | `.gitignore` | 排除构建产物与签名私钥，防止私钥误提交 |
 
 ## 使用方法
@@ -215,14 +215,41 @@ python tools/dns-leak-check.py --json               # 机读输出
 
 ### 打包与发布
 
-两条流水线共用同一个打包脚本，均需手动触发并手填版本号。
+两条流水线共用同一个打包脚本。发布必须显式触发，推送代码不会自动发版。
 
 | 平台 | 配置文件 | 触发方式 |
 | --- | --- | --- |
 | GitHub Actions | `.github/workflows/release.yml` | Actions 页选择工作流，点击运行 |
-| 腾讯 CNB | `.cnb.yml` 与 `.cnb/` | 分支详情页的自定义按钮 |
+| 腾讯 CNB | `.cnb.yml` 引入 `.cnb/pipeline.yml` | 分支推送自动校验；分支详情页按钮或开放接口执行发布 |
 
-产物流向：zip 安装包、CRX3 安装包、SHA-256 校验文件、构建信息文件。GitHub 侧同时写入制品仓库与 Release，CNB 侧同时写入 Release 附件与提交附件。
+#### 推送校验
+
+腾讯 CNB 在任意分支收到推送时自动执行静态校验，不产出发布物、不改动仓库：先由 `.github/scripts/verify.py` 校验清单字段与全部文件引用，再用 `node --check` 校验全部 JavaScript 语法。该脚本可在提交前本地执行：
+
+```bash
+python3 .github/scripts/verify.py
+```
+
+#### 发布流水线
+
+腾讯 CNB 提供两种发布触发途径，二者共用同一份流水线定义。
+
+其一为页面按钮。按钮定义在 `.cnb/web_trigger.yml`，事件名 `web_trigger_release`，显示在仓库「代码 - 分支详情页」。当前仓库仅有 `main` 一个分支，进入该分支详情页即可看到按钮，点击后填入版本号等参数即可启动。仅有仓库写权限的用户可点击该按钮。
+
+其二为开放接口，事件名 `api_trigger_release`。
+
+```bash
+curl -X POST https://api.cnb.cool/zhuzhupower/nonortc/-/build/start \
+  -H "Authorization: Bearer $CNB_TOKEN" \
+  -H "Accept: application/vnd.cnb.api+json" \
+  -H "Content-Type: application/json" \
+  -d '{"branch":"main","event":"api_trigger_release",
+       "env":{"VERSION":"<版本号>","SIGN_MODE":"secret","SYNC_MANIFEST":"true"}}'
+```
+
+页面表单填写的输入项，改用接口触发时必须在 `env` 中显式给出，否则流水线会在版本校验阶段失败。事件名必须是 `api_trigger` 或以 `api_trigger_` 开头，这是接口的硬性限制。令牌需具备 `repo-cnb-trigger:rw` 权限才能调用该接口，若缺少会返回权限不匹配；流水线内含发布 Release 的步骤，因此还需要 `repo-release:rw`，仅具备代码读写权限的令牌无法完成发布。
+
+发布产物流向：zip 安装包、CRX3 安装包、SHA-256 校验文件、构建信息文件。GitHub 侧同时写入制品仓库与 Release，CNB 侧同时写入 Release 附件与提交附件。
 
 ### 签名密钥
 
@@ -234,7 +261,9 @@ openssl rsa -in nonortc-signing-key.pem -pubout -outform DER \
   | openssl dgst -sha256 -binary | head -c 16 | xxd -p | tr '0-9a-f' 'a-p'
 ```
 
-第二条命令输出的三十二位字符即该密钥对应的扩展 ID，可用于核对密钥配置是否正确。生成后把私钥全文填入仓库密钥，变量名为 `CRX_PRIVATE_KEY`：GitHub 在 Settings 的 Secrets 中，CNB 在设置的变量与密钥中。未配置时流水线会退回临时生成并向日志写入警告，此时产出的 ID 每次都不同。
+第二条命令输出的三十二位字符即该密钥对应的扩展 ID，可用于核对密钥配置是否正确。生成后把私钥全文填入仓库密钥，变量名为 `CRX_PRIVATE_KEY`：GitHub 在 Settings 的 Secrets 中，CNB 在「设置 → 变量与密钥」中。CNB 的开放接口不提供密钥写入能力，该步骤只能在网页完成。
+
+未配置该密钥时，发布流水线会在「准备 CRX 签名私钥」阶段直接失败并中止，不产出任何发布物。原因是临时密钥会生成与历史版本不同的扩展 ID，产出一个构建状态为成功、却无法让用户原地升级的安装包，属于必须拦截的错误。仅当联调流水线时，可将 `SIGN_MODE` 设为 `generate` 显式使用临时密钥。
 
 `.gitignore` 已排除 `*.pem`、`*.crx`、`*.zip` 与构建目录，私钥不会随提交入库。
 
